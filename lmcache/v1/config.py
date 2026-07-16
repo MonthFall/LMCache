@@ -358,6 +358,18 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": "cufile",
         "env_converter": str,
     },
+    # Phoenix KV cache adapter (asymmetric GDS: POSIX store + phxfs DMA retrieve)
+    "phx_path": {"type": Optional[str], "default": None, "env_converter": str},
+    "phx_path_sharding": {
+        "type": str,
+        "default": "by_gpu",
+        "env_converter": str,
+    },
+    "phx_buffer_size": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
     # Other configurations
     # (Deprecated) The url of the actual remote lmcache instance for auditing.
     # Please use extra_config['audit_actual_remote_url'] instead.
