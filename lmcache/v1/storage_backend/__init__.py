@@ -241,24 +241,6 @@ def CreateStorageBackends(
         )
         storage_backends[str(gds_backend)] = gds_backend
 
-    if config.phx_path is not None and "PhxBackend" not in _skip:
-        if local_cpu_backend is None:
-            logger.warning(
-                "PhxBackend requires LocalCPUBackend (asymmetric mode); "
-                "skipping PhxBackend creation"
-            )
-        else:
-            from lmcache.v1.storage_backend.phx_backend import PhxBackend
-
-            phx_backend = PhxBackend(
-                config,
-                metadata,
-                loop,
-                dst_device,
-                local_cpu_backend=local_cpu_backend,
-            )
-            storage_backends[str(phx_backend)] = phx_backend
-
     if config.maru_path is not None and "MaruBackend" not in _skip:
         try:
             # First Party
