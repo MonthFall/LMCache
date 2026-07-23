@@ -445,6 +445,11 @@ def transfer_kv_per_object_group(
     """
     if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
         isinstance(mo, GDSMemoryObject) for mo in memory_objs
+    ) and not any(
+        mo is not None
+        and mo.raw_tensor is not None
+        and mo.raw_tensor.device.type != "cpu"
+        for mo in memory_objs
     ):
         _run_object_group_transfer_plan(
             cache_context,

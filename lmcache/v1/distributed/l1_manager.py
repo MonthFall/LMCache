@@ -230,6 +230,72 @@ class L1Manager:
                 lambda: _l1_usage_ratio_or_zero(L1Manager._gauge_target),
             )
 
+    def _free_objs(self, objs: list[MemoryObj]) -> None:
+        """Free a mix of CPU and device memory objs.
+
+        CPU objs (allocated by ``self._memory_manager``) go through the L1
+        memory manager. Device-resident objs (e.g. PhxL2Adapter PHX DMA objs
+        stored in L1 via :meth:`replace_memory_obj`) are freed via their own
+        parent allocator, since the L1 memory manager only owns CPU pinned
+        DRAM. Called only from already-synchronized (``@l1_mgr_synchronized``)
+        methods, so it takes no lock itself.
+        """
+        cpu_objs: list[MemoryObj] = []
+        for o in objs:
+            if o is None:
+                continue
+            try:
+                rt = o.raw_tensor
+            except Exception:
+                rt = None
+            if rt is not None and rt.device.type != "cpu":
+                parent = o.parent()
+                if parent is not None:
+                    parent.free(o)
+                else:
+                    logger.warning(
+                        "L1Manager: device MemoryObj has no parent allocator; "
+                        "cannot free, leaking device memory"
+                    )
+            else:
+                cpu_objs.append(o)
+        if cpu_objs:
+            self._memory_manager.free(cpu_objs)
+
+    @l1_mgr_synchronized
+    def replace_memory_obj(
+        self, key: ObjectKey, new_obj: MemoryObj
+    ) -> L1Error:
+        """Replace the MemoryObj stored for ``key`` with ``new_obj``.
+
+        Used by the prefetch controller when an L2 adapter (e.g.
+        ``PhxL2Adapter``) produces a device-resident MemoryObj that should be
+        served from L1 instead of the CPU buffer pre-allocated by
+        ``reserve_write``. The old CPU obj is freed via :meth:`_free_objs`;
+        the new obj's lifecycle is owned by its own allocator (freed via
+        ``_free_objs`` dispatch on subsequent eviction/delete/read-finish).
+
+        The key must currently exist in L1 (typically write-locked, between
+        ``reserve_write`` and ``finish_write``). Object state (locks,
+        temporary flag) is preserved; only the underlying buffer reference
+        is swapped.
+
+        Args:
+            key: The object key whose MemoryObj should be replaced.
+            new_obj: The new MemoryObj to store (may be device-resident).
+
+        Returns:
+            L1Error.SUCCESS on success, L1Error.KEY_NOT_EXIST otherwise.
+        """
+        entry = self._objects.get(key, None)
+        if entry is None:
+            return L1Error.KEY_NOT_EXIST
+        old_obj = entry.memory_obj
+        entry.memory_obj = new_obj
+        if old_obj is not None:
+            self._free_objs([old_obj])
+        return L1Error.SUCCESS
+
     def register_listener(self, listener: L1ManagerListener) -> None:
         """Register a listener for L1Manager events.
 
@@ -414,7 +480,7 @@ class L1Manager:
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
-        self._memory_manager.free(need_to_free)
+        self._free_objs(need_to_free)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_read_finished(successful_keys)
@@ -697,7 +763,7 @@ class L1Manager:
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
-        self._memory_manager.free(need_to_free)
+        self._free_objs(need_to_free)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(successful_keys)
@@ -737,7 +803,7 @@ class L1Manager:
             )
             all_keys = list(self._objects.keys())
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            self._memory_manager.free(all_memory_objs)
+            self._free_objs(all_memory_objs)
             self._objects.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
@@ -767,7 +833,7 @@ class L1Manager:
         for key in keys_to_clear:
             del self._objects[key]
 
-        self._memory_manager.free(objs_to_free)
+        self._free_objs(objs_to_free)
 
         if keys_to_clear:
             for listener in self._registered_listeners:
@@ -824,7 +890,7 @@ class L1Manager:
         """Close the L1Manager and free all resources."""
         with self._lock:
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            self._memory_manager.free(all_memory_objs)
+            self._free_objs(all_memory_objs)
             self._objects.clear()
 
         self._memory_manager.close()

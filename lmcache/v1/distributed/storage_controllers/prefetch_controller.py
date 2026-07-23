@@ -170,6 +170,12 @@ class InFlightPrefetchRequest:
     # Load phase: keys that were write-reserved in L1
     write_reserved_keys: list[ObjectKey] = field(default_factory=list)
     write_reserved_objs: dict[ObjectKey, MemoryObj] = field(default_factory=dict)
+    # Load phase: adapter_idx -> {key: device MemoryObj} for adapters that
+    # produce device-resident objs (e.g. PhxL2Adapter PHX DMA). Populated by
+    # _poll_load_results via pop_loaded_device_objs; consumed by _finalize_load
+    # to replace the pre-allocated CPU objs in L1 with these device objs so
+    # retrieve serves them via D2D instead of H2D.
+    loaded_device_objs: dict[int, dict[ObjectKey, MemoryObj]] = field(default_factory=dict)
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -1096,6 +1102,13 @@ class PrefetchController(StorageControllerInterface):
             request.load_results[adapter_idx] = result
             del request.pending_load_tasks[adapter_idx]
             request.load_bytes_by_adapter.pop(adapter_idx, None)
+            # Collect device-resident objs produced by this adapter (e.g. PHX
+            # DMA). Non-PHX adapters return {} here (base no-op).
+            device_objs = self._l2_adapters[adapter_idx].pop_loaded_device_objs(
+                task_id
+            )
+            if device_objs:
+                request.loaded_device_objs[adapter_idx] = device_objs
 
             self._event_bus.publish(
                 Event(
@@ -1142,6 +1155,20 @@ class PrefetchController(StorageControllerInterface):
         self._unlock_all_plan_keys(request)
 
         l1_mgr = self._l1_manager
+
+        # Replace pre-allocated CPU objs with device-resident objs produced by
+        # adapters (e.g. PhxL2Adapter PHX DMA), so retrieve serves them via
+        # D2D instead of H2D. The old CPU obj is freed by replace_memory_obj;
+        # the device obj's lifecycle is then owned by L1 (freed via _free_objs
+        # dispatch on eviction/delete/read-finish).
+        if request.loaded_device_objs:
+            all_device_objs: dict[ObjectKey, MemoryObj] = {}
+            for adapter_device_objs in request.loaded_device_objs.values():
+                all_device_objs.update(adapter_device_objs)
+            for key in loaded_keys:
+                device_obj = all_device_objs.get(key)
+                if device_obj is not None:
+                    l1_mgr.replace_memory_obj(key, device_obj)
 
         # Transition loaded keys out of write-locked state.
         if loaded_keys:

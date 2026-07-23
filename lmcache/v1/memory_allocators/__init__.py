@@ -7,6 +7,7 @@ _EXPORT_TO_MODULE = {
     "AdHocMemoryAllocator": "ad_hoc_memory_allocator",
     "BufferAllocator": "buffer_allocator",
     "CuFileMemoryAllocator": "cu_file_memory_allocator",
+    "DeviceMemoryAllocator": "device_memory_allocator",
     "DevDaxMemoryAllocator": "devdax_memory_allocator",
     "GPUMemoryAllocator": "gpu_memory_allocator",
     "HipFileMemoryAllocator": "hip_file_memory_allocator",
@@ -15,7 +16,7 @@ _EXPORT_TO_MODULE = {
     "MixedMemoryAllocator": "mixed_memory_allocator",
     "PagedCpuGpuMemoryAllocator": "paged_cpu_gpu_memory_allocator",
     "PagedTensorMemoryAllocator": "paged_tensor_memory_allocator",
-    "PhxFileMemoryAllocator": "phx_file_memory_allocator",
+    "PhxDeviceMemoryAllocator": "phx_device_memory_allocator",
     "PinMemoryAllocator": "pin_memory_allocator",
     "TensorMemoryAllocator": "tensor_memory_allocator",
 }
