@@ -286,6 +286,17 @@ example ``/dev/ugds_drv0``) rather than a directory. The first
 ``--l1-size-gb`` bytes of the device are the slab, so the device must be at
 least that large and must not hold anything else.
 
+**Phoenix** (``libphoenix.so``) is a fourth opt-in backend selected with
+``--gds-l1-backend phx``. Phoenix (phxfs) provides a kernel-mediated
+user-space NVMe DMA path with a very low software-stack overhead. Like cuFile
+and hipFile it uses a filesystem slab, so ``--gds-l1-path`` names an NVMe
+directory and ``--gds-l1-use-direct-io`` applies; unlike uGDS it requires no
+dedicated raw device. Each GPU staging buffer is registered with phxfs
+(``phxfs_regmem``, 64 KiB-aligned) and the slab is read and written with
+``phxfs_read`` / ``phxfs_write``. It requires the ``phoenixfs`` kernel module
+loaded, the NVMe device managed by phxfs, and a ``libphoenix.so`` reachable
+through the loader (``ldconfig`` or ``LD_LIBRARY_PATH``).
+
 
 
 .. note::
@@ -329,12 +340,12 @@ least that large and must not hold anything else.
      - Not set
      - NVMe directory for the GDS L1 slab, or the raw device path when
        ``--gds-l1-backend ugds`` is used. Setting this enables the GDS L1
-       tier; with cuFile or hipFile one shared slab per process lives at
-       ``<path>/lmcache_gds_slab.bin``.
+       tier; with cuFile, hipFile, or phx one shared slab per process lives
+       at ``<path>/lmcache_gds_slab.bin``.
    * - ``--gds-l1-backend``
      - ``auto``
-     - GDS implementation: ``auto``, ``cufile``, ``hipfile``, or ``ugds``.
-       ``auto`` selects cuFile on CUDA and hipFile on ROCm.
+     - GDS implementation: ``auto``, ``cufile``, ``hipfile``, ``ugds``, or
+       ``phx``. ``auto`` selects cuFile on CUDA and hipFile on ROCm.
    * - ``--gds-l1-use-direct-io`` / ``--no-gds-l1-use-direct-io``
      - ``True``
      - Open the slab with ``O_DIRECT`` (required for the GDS DMA fast path on
