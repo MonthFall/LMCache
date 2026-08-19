@@ -288,14 +288,12 @@ least that large and must not hold anything else.
 
 **Phoenix** (``libphoenix.so``) is a fourth opt-in backend selected with
 ``--gds-l1-backend phx``. Phoenix (phxfs) provides a kernel-mediated
-user-space NVMe DMA path with a very low software-stack overhead. Like cuFile
-and hipFile it uses a filesystem slab, so ``--gds-l1-path`` names an NVMe
-directory and ``--gds-l1-use-direct-io`` applies; unlike uGDS it requires no
-dedicated raw device. Each GPU staging buffer is registered with phxfs
-(``phxfs_regmem``, 64 KiB-aligned) and the slab is read and written with
-``phxfs_read`` / ``phxfs_write``. It requires the ``phoenixfs`` kernel module
-loaded, the NVMe device managed by phxfs, and a ``libphoenix.so`` reachable
-through the loader (``ldconfig`` or ``LD_LIBRARY_PATH``).
+user-space NVMe-to-GPU DMA path with a very low software-stack overhead.
+Like cuFile and hipFile it uses a filesystem slab: ``--gds-l1-path`` names
+an NVMe directory, ``--gds-l1-use-direct-io`` applies, and the slab file
+can share the disk with other data. Each GPU staging buffer is registered with
+phxfs (``phxfs_regmem``, 64 KiB-aligned) and the slab is read and written
+with ``phxfs_read`` / ``phxfs_write``. 
 
 
 
@@ -328,6 +326,14 @@ through the loader (``ldconfig`` or ``LD_LIBRARY_PATH``).
    uGDS requires an **entire dedicated SSD whose contents may be destroyed**.
    Ensure the SSD is not used for any other purpose and that its contents are
    not critical.
+
+.. note::
+
+   Phoenix requires the ``phoenixfs`` kernel module loaded and a
+   platform-matching ``libphoenix.so`` reachable through the loader
+   (``ldconfig`` or ``LD_LIBRARY_PATH``). It has been validated on NVIDIA
+   GPUs; other platforms require a matching ``libphoenix`` build and are not
+   yet tested.
 
 .. list-table::
    :header-rows: 1

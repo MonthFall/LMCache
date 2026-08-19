@@ -3,10 +3,11 @@
 
 These tests are pure: ``libphoenix.so`` is never loaded and no phxfs device
 is opened. A fake library exercises the Python ctypes wrapper, including
-device lifecycle, buffer registration (64 KiB alignment, per-GPU device
-open, duplicate handling), IO argument marshalling and error propagation,
-the V1 synchronous execution semantics (write's stream pre-sync), handle
-lifecycle, and ``close_driver`` cleanup.
+device lifecycle, buffer registration (page-size alignment, where the page
+size is whatever the library's ``phxfs_get_page_size`` reports -- never a
+hardcoded constant; per-GPU device open, duplicate handling), IO argument
+marshalling and error propagation, the V1 synchronous execution semantics
+(write's stream pre-sync), handle lifecycle, and ``close_driver`` cleanup.
 
 The real phxfs ABI and end-to-end DMA path are exercised on Phoenix
 hardware via the GDS L1 tier (``--gds-l1-backend phx``).
@@ -23,8 +24,6 @@ import torch
 # First Party
 from lmcache.v1.gpu_connector import _phx_async as pa
 
-_PAGE = 64 * 1024
-
 
 class _FakeLib:
     """Stand-in for ``libphoenix.so`` that records all symbol calls."""
@@ -32,7 +31,9 @@ class _FakeLib:
     def __init__(self) -> None:
         self.calls: dict[str, list[tuple[Any, ...]]] = {}
         self.events: list[tuple[str, ...]] = []
-        self.page_size = _PAGE
+        # Default mirrors NVIDIA's 64 KiB; individual tests override it to
+        # prove the wrapper derives alignment from the library, not a const.
+        self.page_size = 64 * 1024
         self.map_mode = 0
         self.find_dev_results: dict[int, int] = {}
         self.open_rc = 0
@@ -82,7 +83,7 @@ def _fake_lib(monkeypatch: pytest.MonkeyPatch) -> _FakeLib:
 
 
 def _gpu_tensor(
-    ptr: int = 0x100000, nbytes: int = _PAGE, cuda_index: int = 0
+    ptr: int = 0x100000, nbytes: int = 64 * 1024, cuda_index: int = 0
 ) -> SimpleNamespace:
     """Return a GPU-tensor stand-in accepted by the wrapper."""
     return SimpleNamespace(
@@ -156,27 +157,42 @@ class TestBufferRegistration:
         with pytest.raises(ValueError, match="empty"):
             pa.register_buffer(_gpu_tensor(nbytes=0))
 
-    def test_opens_device_and_aligns_length_to_page_size(
+    def test_opens_device_and_queries_page_size_from_library(
         self, _fake_lib: _FakeLib
     ) -> None:
         pa.register_buffer(_gpu_tensor(ptr=0x200000, nbytes=4096, cuda_index=3))
         assert _fake_lib.calls["phxfs_find_dev"] == [(3,)]
         assert _fake_lib.calls["phxfs_open"] == [(0,)]
+        # The alignment granularity must come from the library interface.
+        assert "phxfs_get_page_size" in _fake_lib.calls
         device, addr, length, _target = _fake_lib.calls["phxfs_regmem"][0]
         assert device == 0
         assert addr == 0x200000
-        assert length == _PAGE
+        assert length == _fake_lib.page_size
 
     @pytest.mark.parametrize(
-        ("nbytes", "expected_len"),
-        [(_PAGE, _PAGE), (2 * _PAGE, 2 * _PAGE), (_PAGE + 1, 2 * _PAGE)],
+        "page_size",
+        [4 * 1024, 64 * 1024, 128 * 1024, 2 * 1024 * 1024],
     )
-    def test_registration_length_alignment(
-        self, _fake_lib: _FakeLib, nbytes: int, expected_len: int
+    def test_registration_alignment_follows_library_page_size(
+        self, _fake_lib: _FakeLib, page_size: int
     ) -> None:
-        pa.register_buffer(_gpu_tensor(ptr=0x200000, nbytes=nbytes))
-        _device, _addr, length, _target = _fake_lib.calls["phxfs_regmem"][0]
-        assert length == expected_len
+        """Alignment is derived from ``phxfs_get_page_size``, not a constant."""
+        _fake_lib.page_size = page_size
+        cases = [
+            (1, page_size),  # sub-page rounds up to one page
+            (page_size, page_size),  # exact single page stays
+            (2 * page_size, 2 * page_size),  # exact multiple stays
+            (page_size + 1, 2 * page_size),  # one page + 1 byte rounds up
+        ]
+        for i, (nbytes, expected_len) in enumerate(cases):
+            # Fresh base pointer per case: re-registering the same base with
+            # a different length is (correctly) rejected as a duplicate.
+            ptr = 0x200000 + i * 0x100000
+            _fake_lib.calls.clear()
+            pa.register_buffer(_gpu_tensor(ptr=ptr, nbytes=nbytes))
+            _device, _addr, length, _target = _fake_lib.calls["phxfs_regmem"][0]
+            assert length == expected_len, f"page_size={page_size}, nbytes={nbytes}"
 
     def test_find_dev_failure_raises(self, _fake_lib: _FakeLib) -> None:
         _fake_lib.find_dev_results = {0: -19}
@@ -216,9 +232,11 @@ class TestBufferRegistration:
     def test_duplicate_register_same_base_different_len_raises(
         self, _fake_lib: _FakeLib
     ) -> None:
-        pa.register_buffer(_gpu_tensor(ptr=0x200000, nbytes=_PAGE))
+        pa.register_buffer(_gpu_tensor(ptr=0x200000, nbytes=_fake_lib.page_size))
         with pytest.raises(RuntimeError, match="different length"):
-            pa.register_buffer(_gpu_tensor(ptr=0x200000, nbytes=2 * _PAGE))
+            pa.register_buffer(
+                _gpu_tensor(ptr=0x200000, nbytes=2 * _fake_lib.page_size)
+            )
         assert len(_fake_lib.calls["phxfs_regmem"]) == 1
 
     def test_deregister_calls_deregmem_with_aligned_length(
@@ -229,7 +247,8 @@ class TestBufferRegistration:
         device, addr, length = _fake_lib.calls["phxfs_deregmem"][0]
         assert device == 0
         assert addr == 0x200000
-        assert length == _PAGE
+        # Deregistration must pass back the same library-aligned length.
+        assert length == _fake_lib.page_size
         assert pa._reg_bases == []
 
     def test_deregister_unregistered_buffer_is_noop(self, _fake_lib: _FakeLib) -> None:
@@ -284,7 +303,7 @@ class TestAsyncHandleIO:
         )
 
     def test_read_async_performs_synchronous_dma(self, _fake_lib: _FakeLib) -> None:
-        pa.register_buffer(_gpu_tensor(ptr=0x300000, nbytes=2 * _PAGE))
+        pa.register_buffer(_gpu_tensor(ptr=0x300000, nbytes=2 * _fake_lib.page_size))
         submission = self._handle().read_async(
             buf_base=0x300000,
             size=4096,
