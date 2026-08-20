@@ -7,9 +7,9 @@ device lifecycle, buffer registration (page-size alignment, where the page
 size is whatever the library's ``phxfs_get_page_size`` reports -- never a
 hardcoded constant; per-GPU device open, duplicate handling), the no-op
 stream-registration surface, stream-ordered IO argument marshalling (byref
-ctypes storage + raw stream handle) and error propagation, the synchronous
-degradation taken when the library predates the stream API (write's
-stream pre-sync), handle lifecycle, and ``close_driver`` cleanup.
+ctypes storage + raw stream handle) and error propagation, the fail-fast taken
+when the library predates the stream API, handle lifecycle, and
+``close_driver`` cleanup.
 
 The real phxfs ABI and end-to-end DMA path are exercised on Phoenix
 hardware via the GDS L1 tier (``--gds-l1-backend phx``).
@@ -38,14 +38,12 @@ class _FakeLib:
         self.page_size = 64 * 1024
         self.map_mode = 0
         # When False, stream symbols raise AttributeError like a CDLL
-        # without them (capability probe must then degrade to sync IO).
+        # without them (loading must then fail fast: no sync fallback).
         self.has_stream_api = True
         self.find_dev_results: dict[int, int] = {}
         self.open_rc = 0
         self.regmem_rc = 0
         self.deregmem_rc = 0
-        self.read_rc: int | None = None  # None -> succeed with nbyte
-        self.write_rc: int | None = None
         self.read_stream_rc = 0
         self.write_stream_rc = 0
         # Optional override for the value written into bytes_done by the
@@ -58,9 +56,9 @@ class _FakeLib:
         return self.page_size
 
     def __getattr__(self, name: str) -> Any:
-        if (
-            not self.has_stream_api
-            and name in pa._STREAM_SYMBOLS
+        if not self.has_stream_api and name in (
+            "phxfs_read_stream",
+            "phxfs_write_stream",
         ):
             raise AttributeError(name)
 
@@ -78,10 +76,6 @@ class _FakeLib:
                 return self.deregmem_rc
             if name == "phxfs_get_map_mode":
                 return self.map_mode
-            if name == "phxfs_read":
-                return self.read_rc if self.read_rc is not None else args[4]
-            if name == "phxfs_write":
-                return self.write_rc if self.write_rc is not None else args[4]
             if name == "phxfs_read_stream":
                 # (fd, dev, buf, nb_p, bo_p, fo_p, bd_p, stream)
                 bd = self.read_stream_bd
@@ -105,7 +99,6 @@ def _fake_lib(monkeypatch: pytest.MonkeyPatch) -> _FakeLib:
     monkeypatch.setattr(pa, "_devices", {})
     monkeypatch.setattr(pa, "_reg_bases", [])
     monkeypatch.setattr(pa, "_reg_entries", [])
-    monkeypatch.setattr(pa, "_stream_api", None)
     # register_buffer falls back to the current CUDA ordinal when the
     # tensor's device index is unset; CI may have no GPU.
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -307,13 +300,19 @@ class TestStreamRegistration:
         pa.deregister_stream(0xABC)
         assert _fake_lib.calls == {}
 
-    def test_capability_probe_degrades_without_stream_symbols(
-        self, _fake_lib: _FakeLib
+    def test_missing_stream_symbols_fail_fast(
+        self, _fake_lib: _FakeLib, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _fake_lib.has_stream_api = False
-        assert pa._has_stream_api(_fake_lib) is False
-        # Cached: the degraded verdict is sticky for this library.
-        assert pa._stream_api is False
+        monkeypatch.setattr(pa, "_lib", None)
+        monkeypatch.setattr(pa.ctypes.util, "find_library", lambda _: "libphoenix.so")
+
+        def _load(path: str) -> Any:
+            return _fake_lib
+
+        monkeypatch.setattr(pa.ctypes, "CDLL", _load)
+        with pytest.raises(RuntimeError, match="stream-ordered API"):
+            pa._get_lib()
 
 
 class TestHandleRegistration:
@@ -484,112 +483,6 @@ class TestAsyncHandleIO:
             raw_stream=0x9,
         )
         assert submission.bytes_done == -5
-
-
-class TestAsyncHandleIOFallback:
-    """Synchronous degradation when libphoenix lacks the stream API."""
-
-    def _handle(self) -> pa.AsyncHandle:
-        return pa.AsyncHandle.from_fd(
-            fd=5,
-            handle=5,
-            path="/mnt/nvme/lmcache_gds_slab.bin",
-            writable=True,
-        )
-
-    @pytest.fixture(autouse=True)
-    def _no_stream_api(self, _fake_lib: _FakeLib) -> _FakeLib:
-        _fake_lib.has_stream_api = False
-        return _fake_lib
-
-    def test_read_async_performs_synchronous_dma(self, _fake_lib: _FakeLib) -> None:
-        pa.register_buffer(_gpu_tensor(ptr=0x300000, nbytes=2 * _fake_lib.page_size))
-        submission = self._handle().read_async(
-            buf_base=0x300000,
-            size=4096,
-            file_offset=8192,
-            buf_offset=512,
-            raw_stream=0x9,
-        )
-        fd, device, buf, buf_offset, nbyte, f_offset = _fake_lib.calls["phxfs_read"][0]
-        assert fd == 5
-        assert device == 0
-        assert buf == 0x300000
-        assert buf_offset == 512
-        assert nbyte == 4096
-        assert f_offset == 8192
-        assert isinstance(submission, pa.Submission)
-        assert submission.bytes_done == 4096
-
-    def test_read_async_propagates_error(self, _fake_lib: _FakeLib) -> None:
-        pa.register_buffer(_gpu_tensor(ptr=0x300000))
-        _fake_lib.read_rc = -28  # ENOSPC
-        with pytest.raises(RuntimeError, match="phxfs_read"):
-            self._handle().read_async(
-                buf_base=0x300000,
-                size=4096,
-                file_offset=0,
-                buf_offset=0,
-                raw_stream=0x9,
-            )
-
-    def test_write_async_syncs_stream_then_dma(
-        self, _fake_lib: _FakeLib, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        synced: list[int] = []
-
-        class _FakeExternalStream:
-            def __init__(self, raw: int) -> None:
-                self.raw = raw
-
-            def synchronize(self) -> None:
-                synced.append(self.raw)
-                _fake_lib.events.append(("stream_sync",))
-
-        monkeypatch.setattr(torch.cuda, "ExternalStream", _FakeExternalStream)
-        pa.register_buffer(_gpu_tensor(ptr=0x300000))
-        submission = self._handle().write_async(
-            buf_base=0x300000,
-            size=2048,
-            file_offset=512,
-            buf_offset=128,
-            raw_stream=0x9,
-        )
-        # The stream sync happened exactly once, before the DMA submission.
-        assert synced == [0x9]
-        assert _fake_lib.events.index(("stream_sync",)) < _fake_lib.events.index(
-            ("phxfs_write",)
-        )
-        fd, device, buf, buf_offset, nbyte, f_offset = _fake_lib.calls["phxfs_write"][0]
-        assert fd == 5
-        assert device == 0
-        assert buf == 0x300000
-        assert buf_offset == 128
-        assert nbyte == 2048
-        assert f_offset == 512
-        assert submission.bytes_done == 2048
-
-    def test_write_async_propagates_error(
-        self, _fake_lib: _FakeLib, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        class _FakeExternalStream:
-            def __init__(self, raw: int) -> None:
-                self.raw = raw
-
-            def synchronize(self) -> None:
-                pass
-
-        monkeypatch.setattr(torch.cuda, "ExternalStream", _FakeExternalStream)
-        pa.register_buffer(_gpu_tensor(ptr=0x300000))
-        _fake_lib.write_rc = -5  # EIO
-        with pytest.raises(RuntimeError, match="phxfs_write"):
-            self._handle().write_async(
-                buf_base=0x300000,
-                size=2048,
-                file_offset=0,
-                buf_offset=0,
-                raw_stream=0x9,
-            )
 
 
 class TestAsyncHandleLifecycle:

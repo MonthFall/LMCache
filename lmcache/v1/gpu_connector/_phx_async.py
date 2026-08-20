@@ -25,11 +25,9 @@ handed to the C API by reference and must stay alive until then (the
 caller -- :mod:`lmcache.v1.gpu_connector.gds_context` -- keeps
 submissions behind a GPU event checkpoint).
 
-If ``libphoenix`` predates the stream-ordered API
-(``phxfs_read_stream`` & co.), the module degrades to the synchronous
-path (``read``: blocking DMA, data-ready on return; ``write``:
-stream-sync then blocking DMA) with the same submission contract --
-correct, just without compute/IO overlap.
+``libphoenix`` must expose the stream-ordered API
+(``phxfs_read_stream`` / ``phxfs_write_stream``): loading fails fast
+otherwise (there is no synchronous fallback).
 
 LMCache expects ``libphoenix.so`` exposing the phxfs API (``phoenix.h``);
 the library is resolved through the loader (``ldconfig`` or
@@ -57,8 +55,22 @@ logger = init_logger(__name__)
 _lib: Optional[ctypes.CDLL] = None
 
 
-def _declare_signatures(lib: ctypes.CDLL) -> None:
+def _declare_signatures(lib: ctypes.CDLL, path_hint: str) -> None:
     """Set argtypes/restype on the phxfs symbols used by this module."""
+    # Stream-ordered API is required (no synchronous fallback): check for
+    # the symbols before touching anything else, so a pre-stream
+    # libphoenix fails fast with a clear message.
+    missing = [
+        sym
+        for sym in ("phxfs_read_stream", "phxfs_write_stream")
+        if not hasattr(lib, sym)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"libphoenix at {path_hint} lacks the stream-ordered API "
+            f"({', '.join(missing)}); build libphoenix with stream support"
+        )
+
     lib.phxfs_find_dev.argtypes = [ctypes.c_int]
     lib.phxfs_find_dev.restype = ctypes.c_int
 
@@ -86,53 +98,20 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.phxfs_deregmem.restype = ctypes.c_int
 
-    lib.phxfs_read.argtypes = [
+    stream_params = [
         ctypes.c_int,  # int fd
-        ctypes.c_int,  # int device_id (phxfs index; >=0 GPU, <0 CPU)
+        ctypes.c_int,  # int device_id (phxfs index)
         ctypes.c_void_p,  # void *buf
-        ctypes.c_int64,  # off_t buf_offset
-        ctypes.c_ssize_t,  # ssize_t nbyte
-        ctypes.c_int64,  # off_t f_offset
+        ctypes.POINTER(ctypes.c_size_t),  # size_t *nbytes
+        ctypes.POINTER(ctypes.c_int64),  # off_t *buf_offset
+        ctypes.POINTER(ctypes.c_int64),  # off_t *f_offset
+        ctypes.POINTER(ctypes.c_ssize_t),  # ssize_t *bytes_done
+        ctypes.c_void_p,  # void *stream (vendor-opaque)
     ]
-    lib.phxfs_read.restype = ctypes.c_ssize_t
-
-    lib.phxfs_write.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_int64,
-        ctypes.c_ssize_t,
-        ctypes.c_int64,
-    ]
-    lib.phxfs_write.restype = ctypes.c_ssize_t
-
-    # Stream-ordered API (libphoenix with stream support). The signatures
-    # mirror cuFileReadAsync/WriteAsync: size/offset/result are pointers the
-    # library writes asynchronously; the stream orders the DMA. There is no
-    # stream registration in phxfs (every submission carries the stream).
-    # Guarded so an older libphoenix without the symbols still loads (the
-    # module then degrades to the synchronous path).
-    if all(
-        hasattr(lib, sym)
-        for sym in (
-            "phxfs_read_stream",
-            "phxfs_write_stream",
-        )
-    ):
-        stream_params = [
-            ctypes.c_int,  # int fd
-            ctypes.c_int,  # int device_id (phxfs index)
-            ctypes.c_void_p,  # void *buf
-            ctypes.POINTER(ctypes.c_size_t),  # size_t *nbytes
-            ctypes.POINTER(ctypes.c_int64),  # off_t *buf_offset
-            ctypes.POINTER(ctypes.c_int64),  # off_t *f_offset
-            ctypes.POINTER(ctypes.c_ssize_t),  # ssize_t *bytes_done
-            ctypes.c_void_p,  # void *stream (vendor-opaque)
-        ]
-        lib.phxfs_read_stream.argtypes = stream_params
-        lib.phxfs_read_stream.restype = ctypes.c_int
-        lib.phxfs_write_stream.argtypes = stream_params
-        lib.phxfs_write_stream.restype = ctypes.c_int
+    lib.phxfs_read_stream.argtypes = stream_params
+    lib.phxfs_read_stream.restype = ctypes.c_int
+    lib.phxfs_write_stream.argtypes = stream_params
+    lib.phxfs_write_stream.restype = ctypes.c_int
 
 
 def _get_lib() -> ctypes.CDLL:
@@ -143,7 +122,7 @@ def _get_lib() -> ctypes.CDLL:
     search = ctypes.util.find_library("phoenix")
     path = search or "libphoenix.so"
     lib = ctypes.CDLL(path)
-    _declare_signatures(lib)
+    _declare_signatures(lib, path)
     _lib = lib
     return _lib
 
@@ -166,29 +145,7 @@ _reg_entries: list[tuple[int, int]] = []
 _page_size: int = 0
 """Cached device page size in bytes (64 KiB on NVIDIA); 0 = not queried."""
 
-_stream_api: Optional[bool] = None
-"""Whether the loaded libphoenix exports the stream-ordered API; None =
-not probed yet. Resolved once on first use (:func:`_has_stream_api`)."""
-
 _MAP_MODE_NAMES = {0: "FULL", 1: "STAGING"}
-
-_STREAM_SYMBOLS = (
-    "phxfs_read_stream",
-    "phxfs_write_stream",
-)
-
-
-def _has_stream_api(lib: ctypes.CDLL) -> bool:
-    """Probe (once) whether the loaded libphoenix has the stream API."""
-    global _stream_api
-    if _stream_api is None:
-        _stream_api = all(hasattr(lib, sym) for sym in _STREAM_SYMBOLS)
-        if not _stream_api:
-            logger.info(
-                "_phx_async: libphoenix lacks the stream-ordered API; "
-                "degrading to synchronous IO (no compute/IO overlap)"
-            )
-    return _stream_api
 
 
 def _align_up(size: int, alignment: int) -> int:
@@ -490,59 +447,11 @@ def _submit_stream(
         )
 
 
-def _do_read(
-    fd: int, buf_base: int, size: int, file_offset: int, buf_offset: int
-) -> int:
-    """Synchronous fallback read DMA (data-ready on return).
-
-    Used when libphoenix predates the stream-ordered API; returning from
-    this function satisfies the async contract (the data is visible to
-    anything the caller enqueues on the stream afterwards).
-    """
-    phxfs_dev = _lookup_device(buf_base)
-    result = int(
-        _get_lib().phxfs_read(fd, phxfs_dev, buf_base, buf_offset, size, file_offset)
-    )
-    if result < 0:
-        raise RuntimeError(
-            f"phxfs_read failed with {result}: fd={fd}, device={phxfs_dev}, "
-            f"buf_offset={buf_offset}, nbyte={size}, f_offset={file_offset}"
-        )
-    return result
-
-
-def _do_write(
-    fd: int,
-    buf_base: int,
-    size: int,
-    file_offset: int,
-    buf_offset: int,
-    raw_stream: int,
-) -> int:
-    """Synchronous fallback write DMA (stream-sync, then DMA).
-
-    Used when libphoenix predates the stream-ordered API: synchronize
-    ``raw_stream`` first so any gather enqueued before this call has
-    finished writing the GPU buffer, then issue the blocking DMA.
-    """
-    torch.cuda.ExternalStream(raw_stream).synchronize()
-    phxfs_dev = _lookup_device(buf_base)
-    result = int(
-        _get_lib().phxfs_write(fd, phxfs_dev, buf_base, buf_offset, size, file_offset)
-    )
-    if result < 0:
-        raise RuntimeError(
-            f"phxfs_write failed with {result}: fd={fd}, device={phxfs_dev}, "
-            f"buf_offset={buf_offset}, nbyte={size}, f_offset={file_offset}"
-        )
-    return result
-
-
 # --- Submission + AsyncHandle --------------------------------------------
 
 
 class Submission:
-    """One in-flight (stream-ordered) or completed (fallback) phxfs IO.
+    """One in-flight (stream-ordered) phxfs IO.
 
     Mirrors :class:`_cufile_async.Submission`: holds the transfer
     parameters and the ``bytes_done`` result storage. The ctypes fields
@@ -635,25 +544,14 @@ class AsyncHandle:
                 submission itself fails.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-        lib = _get_lib()
-        phxfs_dev = _lookup_device(buf_base)
-        if _has_stream_api(lib):
-            _submit_stream(
-                lib,
-                is_write=False,
-                fd=self._fd,
-                buf_base=buf_base,
-                phxfs_dev=phxfs_dev,
-                sub=sub,
-                raw_stream=raw_stream,
-            )
-            return sub
-        sub._bytes_done.value = _do_read(
+        _submit_stream(
+            _get_lib(),
+            is_write=False,
             fd=self._fd,
             buf_base=buf_base,
-            size=size,
-            file_offset=file_offset,
-            buf_offset=buf_offset,
+            phxfs_dev=_lookup_device(buf_base),
+            sub=sub,
+            raw_stream=raw_stream,
         )
         return sub
 
@@ -688,25 +586,13 @@ class AsyncHandle:
                 submission itself fails.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-        lib = _get_lib()
-        phxfs_dev = _lookup_device(buf_base)
-        if _has_stream_api(lib):
-            _submit_stream(
-                lib,
-                is_write=True,
-                fd=self._fd,
-                buf_base=buf_base,
-                phxfs_dev=phxfs_dev,
-                sub=sub,
-                raw_stream=raw_stream,
-            )
-            return sub
-        sub._bytes_done.value = _do_write(
+        _submit_stream(
+            _get_lib(),
+            is_write=True,
             fd=self._fd,
             buf_base=buf_base,
-            size=size,
-            file_offset=file_offset,
-            buf_offset=buf_offset,
+            phxfs_dev=_lookup_device(buf_base),
+            sub=sub,
             raw_stream=raw_stream,
         )
         return sub
