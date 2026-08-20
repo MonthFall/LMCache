@@ -292,8 +292,12 @@ user-space NVMe-to-GPU DMA path with a very low software-stack overhead.
 Like cuFile and hipFile it uses a filesystem slab: ``--gds-l1-path`` names
 an NVMe directory, ``--gds-l1-use-direct-io`` applies, and the slab file
 can share the disk with other data. Each GPU staging buffer is registered with
-phxfs (``phxfs_regmem``, 64 KiB-aligned) and the slab is read and written
-with ``phxfs_read`` / ``phxfs_write``. 
+phxfs (``phxfs_regmem``, 64 KiB-aligned) and each stream with
+``phxfs_regstream``; the slab is then read and written with stream-ordered
+submissions (``phxfs_read_stream`` / ``phxfs_write_stream``) that keep the
+DMA ordered with the other work on the stream. A ``libphoenix`` build
+without the stream-ordered API transparently falls back to synchronous
+``phxfs_read`` / ``phxfs_write`` (correct, without compute/IO overlap).
 
 
 

@@ -10,24 +10,24 @@ common backend surface maps naturally:
   device and registers the buffer 64 KiB-aligned).
 - :func:`register_handle` is a passthrough: phxfs operates on plain POSIX
   fds, so the "handle" is the fd itself.
-- :class:`AsyncHandle.read_async` / ``write_async`` wrap
-  ``phxfs_read`` / ``phxfs_write``.
+- :func:`register_stream` wraps ``phxfs_regstream``; IO submissions are
+  stream-ordered via ``phxfs_read_stream`` / ``phxfs_write_stream``.
 
-V1 execution semantics (synchronous degradation): unlike cuFile/uGDS,
-phxfs has no stream-ordered submission yet -- the DMA is host-initiated
-and ``phxfs_read`` / ``phxfs_write`` return only once the transfer is
-complete. This wrapper keeps the stream-ordered API shape so
-:mod:`lmcache.v1.gpu_connector.gds_context` works unmodified:
+Execution semantics (stream-ordered, cuFile-compatible): submissions
+enqueue a DMA that is ordered on the caller's CUDA/ROCm stream -- after
+everything the caller enqueued before the submission, and before
+everything enqueued after it. The submission returns immediately; the
+transfer outcome lands in :attr:`Submission.bytes_done` once the stream
+is synchronized past it. The :class:`Submission`'s ctypes storage is
+handed to the C API by reference and must stay alive until then (the
+caller -- :mod:`lmcache.v1.gpu_connector.gds_context` -- keeps
+submissions behind a GPU event checkpoint).
 
-- ``read_async``: the completed synchronous DMA already guarantees the
-  data is visible to any subsequent op enqueued on the stream, so
-  returning right away is safe.
-- ``write_async``: synchronizes ``raw_stream`` first so any preceding
-  gather on that stream has completed before the DMA reads the buffer.
-
-The IO submission is funneled through :func:`_do_read` / :func:`_do_write`
-so the planned stream-ordered phxgds shim (flag-slot stream bridging in
-libphoenix) can later replace only those bodies.
+If ``libphoenix`` predates the stream-ordered API
+(``phxfs_read_stream`` & co.), the module degrades to the synchronous
+path (``read``: blocking DMA, data-ready on return; ``write``:
+stream-sync then blocking DMA) with the same submission contract --
+correct, just without compute/IO overlap.
 
 LMCache expects ``libphoenix.so`` exposing the phxfs API (``phoenix.h``);
 the library is resolved through the loader (``ldconfig`` or
@@ -104,6 +104,47 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.phxfs_write.restype = ctypes.c_ssize_t
 
+    # Stream-ordered API (libphoenix with stream support). The signatures
+    # mirror cuFileReadAsync/WriteAsync: size/offset/result are pointers the
+    # library writes asynchronously; the stream orders the DMA. Guarded so
+    # an older libphoenix without the symbols still loads (the module then
+    # degrades to the synchronous path).
+    if all(
+        hasattr(lib, sym)
+        for sym in (
+            "phxfs_read_stream",
+            "phxfs_write_stream",
+            "phxfs_regstream",
+            "phxfs_deregstream",
+        )
+    ):
+        stream_params = [
+            ctypes.c_int,  # int fd
+            ctypes.c_int,  # int device_id (phxfs index)
+            ctypes.c_void_p,  # void *buf
+            ctypes.POINTER(ctypes.c_size_t),  # size_t *nbytes
+            ctypes.POINTER(ctypes.c_int64),  # off_t *buf_offset
+            ctypes.POINTER(ctypes.c_int64),  # off_t *f_offset
+            ctypes.POINTER(ctypes.c_ssize_t),  # ssize_t *bytes_done
+            ctypes.c_void_p,  # void *stream (vendor-opaque)
+        ]
+        lib.phxfs_read_stream.argtypes = stream_params
+        lib.phxfs_read_stream.restype = ctypes.c_int
+        lib.phxfs_write_stream.argtypes = stream_params
+        lib.phxfs_write_stream.restype = ctypes.c_int
+
+        lib.phxfs_regstream.argtypes = [
+            ctypes.c_int,  # int device_id (phxfs index)
+            ctypes.c_void_p,  # void *stream
+        ]
+        lib.phxfs_regstream.restype = ctypes.c_int
+
+        lib.phxfs_deregstream.argtypes = [
+            ctypes.c_int,  # int device_id (phxfs index)
+            ctypes.c_void_p,  # void *stream
+        ]
+        lib.phxfs_deregstream.restype = ctypes.c_int
+
 
 def _get_lib() -> ctypes.CDLL:
     """Load ``libphoenix.so`` on first use and declare the phxfs ABI."""
@@ -132,11 +173,37 @@ _reg_bases: list[int] = []
 """Sorted registered buffer base pointers (parallel to ``_reg_entries``)."""
 _reg_entries: list[tuple[int, int]] = []
 """(aligned_length, phxfs_device_index) per entry in ``_reg_bases``."""
+_streams: dict[int, int] = {}
+"""Registered raw stream handle -> phxfs device index (for deregistration)."""
 
 _page_size: int = 0
 """Cached device page size in bytes (64 KiB on NVIDIA); 0 = not queried."""
 
+_stream_api: Optional[bool] = None
+"""Whether the loaded libphoenix exports the stream-ordered API; None =
+not probed yet. Resolved once on first use (:func:`_has_stream_api`)."""
+
 _MAP_MODE_NAMES = {0: "FULL", 1: "STAGING"}
+
+_STREAM_SYMBOLS = (
+    "phxfs_read_stream",
+    "phxfs_write_stream",
+    "phxfs_regstream",
+    "phxfs_deregstream",
+)
+
+
+def _has_stream_api(lib: ctypes.CDLL) -> bool:
+    """Probe (once) whether the loaded libphoenix has the stream API."""
+    global _stream_api
+    if _stream_api is None:
+        _stream_api = all(hasattr(lib, sym) for sym in _STREAM_SYMBOLS)
+        if not _stream_api:
+            logger.info(
+                "_phx_async: libphoenix lacks the stream-ordered API; "
+                "degrading to synchronous IO (no compute/IO overlap)"
+            )
+    return _stream_api
 
 
 def _align_up(size: int, alignment: int) -> int:
@@ -337,31 +404,84 @@ def deregister_buffer(buf: torch.Tensor) -> None:
 
 
 def register_stream(raw_stream: int) -> None:
-    """No-op in V1: the synchronous execution path needs no stream state.
+    """Register a GPU stream for stream-ordered phxfs IO.
 
-    V2 (stream-ordered phxgds shim) will allocate a flag slot per stream
-    here.
+    Wraps ``phxfs_regstream``: the library allocates a completion flag on
+    the device and wires the stream's ordering gate. The device is taken
+    from the current CUDA/ROCm device (the GDS L1 tier registers streams
+    from the worker's single-GPU context). Without the stream API in
+    libphoenix this is a no-op (synchronous degradation).
 
     Args:
-        raw_stream: Raw CUDA/ROCm stream handle (unused in V1).
+        raw_stream: Raw CUDA/ROCm stream handle, as passed by
+            :meth:`gds_context.GDSContext.register_gpu_buffer`.
+
+    Raises:
+        RuntimeError: If the phxfs device cannot be opened or
+            ``phxfs_regstream`` fails.
     """
-    del raw_stream
+    lib = _get_lib()
+    if not _has_stream_api(lib):
+        return
+    cuda_ordinal = torch.cuda.current_device()
+    with _state_lock:
+        if raw_stream in _streams:
+            return  # idempotent: gds_context already guards, be tolerant
+        phxfs_dev = _ensure_device_open_locked(lib, cuda_ordinal)
+        rc = int(lib.phxfs_regstream(phxfs_dev, ctypes.c_void_p(raw_stream)))
+        if rc < 0:
+            raise RuntimeError(
+                f"phxfs_regstream failed with {rc}: device={phxfs_dev}, "
+                f"stream=0x{raw_stream:x}"
+            )
+        _streams[raw_stream] = phxfs_dev
 
 
 def deregister_stream(raw_stream: int) -> None:
-    """No-op in V1 (see :func:`register_stream`)."""
-    del raw_stream
+    """Reverse of :func:`register_stream`.
+
+    Wraps ``phxfs_deregstream``, which blocks until every submission still
+    in flight on the stream has completed. Unregistered streams are
+    ignored (matching the tolerance of the cuFile path teardown).
+
+    Raises:
+        RuntimeError: If ``phxfs_deregstream`` fails.
+    """
+    lib = _get_lib()
+    with _state_lock:
+        phxfs_dev = _streams.get(raw_stream)
+        if phxfs_dev is None:
+            return
+        rc = int(lib.phxfs_deregstream(phxfs_dev, ctypes.c_void_p(raw_stream)))
+        if rc < 0:
+            raise RuntimeError(
+                f"phxfs_deregstream failed with {rc}: device={phxfs_dev}, "
+                f"stream=0x{raw_stream:x}"
+            )
+        del _streams[raw_stream]
 
 
 def close_driver() -> None:
     """Release every phxfs registration and close all opened devices.
 
-    Sweeps any registration still left in the table (the normal teardown
-    path deregisters each buffer via :func:`deregister_buffer`), then
-    closes every opened phxfs device.
+    Sweeps any stream/buffer registration still left in the tables (the
+    normal teardown path deregisters each via :func:`deregister_stream` /
+    :func:`deregister_buffer`), then closes every opened phxfs device.
     """
     lib = _get_lib()
     with _state_lock:
+        for raw_stream, phxfs_dev in list(_streams.items()):
+            try:
+                rc = int(lib.phxfs_deregstream(phxfs_dev, ctypes.c_void_p(raw_stream)))
+                if rc < 0:
+                    logger.warning(
+                        "close_driver: phxfs_deregstream(0x%x) failed with %d",
+                        raw_stream,
+                        rc,
+                    )
+            except Exception as e:  # noqa: BLE001 - teardown sweep
+                logger.warning("close_driver: phxfs_deregstream raised %s", e)
+        _streams.clear()
         for base, (aligned_len, phxfs_dev) in zip(
             _reg_bases, _reg_entries, strict=True
         ):
@@ -388,18 +508,66 @@ def close_driver() -> None:
         _devices.clear()
 
 
-# --- IO submission (V2 switchover point) ---------------------------------
+# --- IO submission --------------------------------------------------------
+
+
+def _submit_stream(
+    lib: ctypes.CDLL,
+    is_write: bool,
+    fd: int,
+    buf_base: int,
+    phxfs_dev: int,
+    sub: "Submission",
+    raw_stream: int,
+) -> None:
+    """Submit one stream-ordered DMA (``phxfs_read/write_stream``).
+
+    Hands the submission's ctypes storage to the C API by reference: the
+    library reads the transfer parameters at submission time and writes
+    ``bytes_done`` asynchronously, so ``sub`` must stay alive until the
+    stream is synchronized past this op (the caller owns that lifetime).
+
+    Raises:
+        RuntimeError: On a submission-level failure (negative return from
+            the C API). Transfer failures are NOT raised here -- they land
+            in ``sub.bytes_done`` after the stream sync (cuFile contract).
+    """
+    with _state_lock:
+        registered = raw_stream in _streams
+    if not registered:
+        raise RuntimeError(
+            f"{'write' if is_write else 'read'}_async: stream "
+            f"0x{raw_stream:x} is not registered (register_stream first)"
+        )
+    fn = lib.phxfs_write_stream if is_write else lib.phxfs_read_stream
+    rc = int(
+        fn(
+            fd,
+            phxfs_dev,
+            buf_base,
+            ctypes.byref(sub._size),
+            ctypes.byref(sub._buf_offset),
+            ctypes.byref(sub._file_offset),
+            ctypes.byref(sub._bytes_done),
+            ctypes.c_void_p(raw_stream),
+        )
+    )
+    if rc < 0:
+        op = "phxfs_write_stream" if is_write else "phxfs_read_stream"
+        raise RuntimeError(
+            f"{op} failed with {rc}: fd={fd}, device={phxfs_dev}, "
+            f"buf_base=0x{buf_base:x}, stream=0x{raw_stream:x}"
+        )
 
 
 def _do_read(
     fd: int, buf_base: int, size: int, file_offset: int, buf_offset: int
 ) -> int:
-    """Perform one read DMA; return when the data is in the GPU buffer.
+    """Synchronous fallback read DMA (data-ready on return).
 
-    V1: synchronous ``phxfs_read`` -- returning from this function means
-    the transfer is complete, which satisfies the async contract (data is
-    visible to anything the caller enqueues on the stream afterwards).
-    V2: replace the body with the stream-ordered phxgds submission.
+    Used when libphoenix predates the stream-ordered API; returning from
+    this function satisfies the async contract (the data is visible to
+    anything the caller enqueues on the stream afterwards).
     """
     phxfs_dev = _lookup_device(buf_base)
     result = int(
@@ -421,12 +589,11 @@ def _do_write(
     buf_offset: int,
     raw_stream: int,
 ) -> int:
-    """Perform one write DMA after the stream's prior work completes.
+    """Synchronous fallback write DMA (stream-sync, then DMA).
 
-    V1: synchronize ``raw_stream`` first so any gather enqueued before
-    this call has finished writing the GPU buffer, then issue the
-    synchronous ``phxfs_write``. V2: replace the body with the
-    stream-ordered phxgds submission (fence + DMA).
+    Used when libphoenix predates the stream-ordered API: synchronize
+    ``raw_stream`` first so any gather enqueued before this call has
+    finished writing the GPU buffer, then issue the blocking DMA.
     """
     torch.cuda.ExternalStream(raw_stream).synchronize()
     phxfs_dev = _lookup_device(buf_base)
@@ -445,12 +612,13 @@ def _do_write(
 
 
 class Submission:
-    """One completed (V1) or in-flight (V2) phxfs read / write.
+    """One in-flight (stream-ordered) or completed (fallback) phxfs IO.
 
     Mirrors :class:`_cufile_async.Submission`: holds the transfer
-    parameters and the ``bytes_done`` result storage. V2 will hand the
-    same ctypes storage to the phxgds shim, so the keep-alive-until-sync
-    contract documented there applies unchanged.
+    parameters and the ``bytes_done`` result storage. The ctypes fields
+    are handed to the stream-ordered C API by reference, so the
+    keep-alive-until-stream-sync contract documented there applies
+    unchanged (the GDS context's event checkpoint owns that lifetime).
     """
 
     __slots__ = ("_size", "_file_offset", "_buf_offset", "_bytes_done")
@@ -515,26 +683,41 @@ class AsyncHandle:
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
-        """Read ``size`` bytes from the slab into the registered GPU buffer.
+        """Submit a stream-ordered read DMA into the registered GPU buffer.
 
-        V1 executes the DMA synchronously; the returned :class:`Submission`
-        already carries the final ``bytes_done``.
+        Returns immediately; the data is guaranteed to be visible to any
+        op the caller enqueues on ``raw_stream`` after this call. The
+        transfer outcome lands in ``submission.bytes_done`` once the
+        stream is synchronized past this op.
 
         Args:
             buf_base: Base pointer of a registered GPU buffer region.
             size: Transfer length in bytes.
             file_offset: Slab-file offset to read from.
             buf_offset: Offset within the GPU buffer region.
-            raw_stream: Raw stream handle (unused by the V1 read path).
+            raw_stream: Raw handle of the registered stream ordering the DMA.
 
         Returns:
-            The (completed) submission.
+            The in-flight submission (keep alive until the stream sync).
 
         Raises:
-            RuntimeError: If ``buf_base`` is not registered or the DMA fails.
+            RuntimeError: If ``buf_base`` is not registered, the stream is
+                not registered, or the submission itself fails.
         """
-        del raw_stream  # V1 read needs no stream ordering (data-ready on return)
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+        lib = _get_lib()
+        phxfs_dev = _lookup_device(buf_base)
+        if _has_stream_api(lib):
+            _submit_stream(
+                lib,
+                is_write=False,
+                fd=self._fd,
+                buf_base=buf_base,
+                phxfs_dev=phxfs_dev,
+                sub=sub,
+                raw_stream=raw_stream,
+            )
+            return sub
         sub._bytes_done.value = _do_read(
             fd=self._fd,
             buf_base=buf_base,
@@ -552,26 +735,42 @@ class AsyncHandle:
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
-        """Write ``size`` bytes from the registered GPU buffer to the slab.
+        """Submit a stream-ordered write DMA from the registered GPU buffer.
 
-        V1 synchronizes ``raw_stream`` (draining any prior gather) before
-        issuing the synchronous DMA.
+        The DMA is ordered after everything previously enqueued on
+        ``raw_stream`` (e.g. the gather producing the data), so the buffer
+        contents are stable when the DMA reads them. Returns immediately;
+        the outcome lands in ``submission.bytes_done`` after the stream
+        sync.
 
         Args:
             buf_base: Base pointer of a registered GPU buffer region.
             size: Transfer length in bytes.
             file_offset: Slab-file offset to write to.
             buf_offset: Offset within the GPU buffer region.
-            raw_stream: Raw stream handle whose prior work must complete
-                before the DMA reads the buffer.
+            raw_stream: Raw handle of the registered stream ordering the DMA.
 
         Returns:
-            The (completed) submission.
+            The in-flight submission (keep alive until the stream sync).
 
         Raises:
-            RuntimeError: If ``buf_base`` is not registered or the DMA fails.
+            RuntimeError: If ``buf_base`` is not registered, the stream is
+                not registered, or the submission itself fails.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+        lib = _get_lib()
+        phxfs_dev = _lookup_device(buf_base)
+        if _has_stream_api(lib):
+            _submit_stream(
+                lib,
+                is_write=True,
+                fd=self._fd,
+                buf_base=buf_base,
+                phxfs_dev=phxfs_dev,
+                sub=sub,
+                raw_stream=raw_stream,
+            )
+            return sub
         sub._bytes_done.value = _do_write(
             fd=self._fd,
             buf_base=buf_base,
