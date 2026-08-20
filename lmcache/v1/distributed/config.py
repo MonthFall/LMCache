@@ -165,9 +165,11 @@ class GdsL1Config:
 
     When present on :class:`L1ManagerConfig`, the L1 medium becomes an NVMe
     slab accessed via GPUDirect Storage DMA instead of pinned DRAM (mutually
-    exclusive with the pinned-DRAM tier in ``memory_config``). cuFile,
-    hipFile, and Phoenix use a filesystem slab; uGDS uses a raw device.
-    Carries the slab location, capacity, backend, and DMA mode.
+    exclusive with the pinned-DRAM tier in ``memory_config``). cuFile and
+    hipFile use a filesystem slab; uGDS uses a raw device. Phoenix uses a
+    filesystem slab on any VFS-mounted storage: local NVMe for the DMA fast
+    path, NFS / NVMe-oF mounts with degraded (non-DMA) performance. Carries
+    the slab location, capacity, backend, and DMA mode.
     """
 
     file_location: str
@@ -419,8 +421,10 @@ def add_storage_manager_args(
         "Configuration for the GDS L1 tier. Setting --gds-l1-path makes the "
         "L1 medium an NVMe slab accessed via GPUDirect Storage DMA instead of "
         "pinned DRAM; --l1-size-gb then sizes the slab. cuFile, hipFile, and "
-        "phx use a slab file, while uGDS uses a dedicated raw device. Disable "
-        "byte-array L2 adapters when this is on.",
+        "phx use a slab file (phx takes any VFS path: local NVMe for the DMA "
+        "fast path, NFS/NVMe-oF with degraded performance), while uGDS uses "
+        "a dedicated raw device. Disable byte-array L2 adapters when this "
+        "is on.",
     )
     gds_group.add_argument(
         "--gds-l1-path",

@@ -123,6 +123,19 @@ def _get_lib() -> ctypes.CDLL:
     return _lib
 
 
+# --- Error checking ---------------------------------------------------
+
+
+def _check(rc: int, op: str) -> None:
+    """Convert a negative phxfs return code into a Python exception."""
+    if rc < 0:
+        try:
+            why = os.strerror(-rc)
+        except ValueError:
+            why = "unknown error"
+        raise RuntimeError(f"{op} failed: phxfsError(rc={rc} [{why}])")
+
+
 # --- Device + buffer registration state ----------------------------------
 #
 # phxfs devices are opened once per CUDA/HIP ordinal (find_dev + open) and
@@ -173,11 +186,8 @@ def _ensure_device_open_locked(lib: ctypes.CDLL, cuda_ordinal: int) -> int:
     if phxfs_dev is not None:
         return phxfs_dev
     phxfs_dev = int(lib.phxfs_find_dev(cuda_ordinal))
-    if phxfs_dev < 0:
-        raise RuntimeError(f"phxfs_find_dev({cuda_ordinal}) failed with {phxfs_dev}")
-    rc = int(lib.phxfs_open(phxfs_dev))
-    if rc < 0:
-        raise RuntimeError(f"phxfs_open({phxfs_dev}) failed with {rc}")
+    _check(phxfs_dev, f"phxfs_find_dev({cuda_ordinal})")
+    _check(int(lib.phxfs_open(phxfs_dev)), f"phxfs_open({phxfs_dev})")
     _devices[cuda_ordinal] = phxfs_dev
     try:
         map_mode = int(lib.phxfs_get_map_mode(phxfs_dev))
@@ -253,30 +263,22 @@ def register_buffer(buf: torch.Tensor) -> None:
         phxfs_dev = _ensure_device_open_locked(lib, cuda_ordinal)
         page_size = _get_page_size_locked(lib)
         aligned_len = _align_up(nbytes, page_size)
-        # Reject a mismatched duplicate before touching phxfs (an exact
-        # duplicate is reference-counted by phxfs and allowed through).
-        idx = bisect.bisect_left(_reg_bases, base)
-        if idx < len(_reg_bases) and _reg_bases[idx] == base:
-            prev_len, _ = _reg_entries[idx]
-            if prev_len != aligned_len:
-                raise RuntimeError(
-                    f"register_buffer: 0x{base:x} already registered with "
-                    f"a different length ({prev_len} != {aligned_len})"
-                )
         target_addr = ctypes.c_void_p()
-        rc = int(
-            lib.phxfs_regmem(phxfs_dev, base, aligned_len, ctypes.byref(target_addr))
+        _check(
+            int(
+                lib.phxfs_regmem(
+                    phxfs_dev, base, aligned_len, ctypes.byref(target_addr)
+                )
+            ),
+            "phxfs_regmem",
         )
-        if rc < 0:
-            raise RuntimeError(
-                f"phxfs_regmem failed with {rc}: device={phxfs_dev}, "
-                f"addr=0x{base:x}, len={aligned_len}"
-            )
         # NOTE: target_addr is an internal host-mapped handle; IO must use
         # the original device address, so it is deliberately not recorded.
-        if idx < len(_reg_bases) and _reg_bases[idx] == base:
-            # Exact duplicate: phxfs reference-counts it; keep one entry.
-            return
+        # Duplicate/overlap detection is entirely the library's job
+        # (phxfs_regmem reference-counts exact duplicates and rejects
+        # overlapping ranges); every successful call is recorded so
+        # register/deregister stay symmetric.
+        idx = bisect.bisect_left(_reg_bases, base)
         _reg_bases.insert(idx, base)
         _reg_entries.insert(idx, (aligned_len, phxfs_dev))
     logger.debug(
@@ -307,12 +309,10 @@ def deregister_buffer(buf: torch.Tensor) -> None:
         if idx >= len(_reg_bases) or _reg_bases[idx] != base:
             return
         aligned_len, phxfs_dev = _reg_entries[idx]
-        rc = int(lib.phxfs_deregmem(phxfs_dev, base, aligned_len))
-        if rc < 0:
-            raise RuntimeError(
-                f"phxfs_deregmem failed with {rc}: device={phxfs_dev}, "
-                f"addr=0x{base:x}, len={aligned_len}"
-            )
+        _check(
+            int(lib.phxfs_deregmem(phxfs_dev, base, aligned_len)),
+            "phxfs_deregmem",
+        )
         del _reg_bases[idx]
         del _reg_entries[idx]
 
@@ -372,48 +372,6 @@ def close_driver() -> None:
 
 
 # --- IO submission --------------------------------------------------------
-
-
-def _submit_stream(
-    lib: ctypes.CDLL,
-    is_write: bool,
-    fd: int,
-    buf_base: int,
-    sub: "Submission",
-    raw_stream: int,
-) -> None:
-    """Submit one stream-ordered DMA (``phxfs_read/write_stream``).
-
-    Hands the submission's ctypes storage to the C API by reference: the
-    library reads the transfer parameters at submission time and writes
-    ``bytes_done`` asynchronously, so ``sub`` must stay alive until the
-    stream is synchronized past this op (the caller owns that lifetime).
-    The buffer device is resolved inside the library from the buffer
-    itself (registration table hit -> GPU DMA, miss -> plain CPU address).
-
-    Raises:
-        RuntimeError: On a submission-level failure (negative return from
-            the C API). Transfer failures are NOT raised here -- they land
-            in ``sub.bytes_done`` after the stream sync (cuFile contract).
-    """
-    fn = lib.phxfs_write_stream if is_write else lib.phxfs_read_stream
-    rc = int(
-        fn(
-            fd,
-            buf_base,
-            ctypes.byref(sub._size),
-            ctypes.byref(sub._buf_offset),
-            ctypes.byref(sub._file_offset),
-            ctypes.byref(sub._bytes_done),
-            ctypes.c_void_p(raw_stream),
-        )
-    )
-    if rc < 0:
-        op = "phxfs_write_stream" if is_write else "phxfs_read_stream"
-        raise RuntimeError(
-            f"{op} failed with {rc}: fd={fd}, "
-            f"buf_base=0x{buf_base:x}, stream=0x{raw_stream:x}"
-        )
 
 
 # --- Submission + AsyncHandle --------------------------------------------
@@ -514,13 +472,17 @@ class AsyncHandle:
                 ``submission.bytes_done`` after the stream sync.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-        _submit_stream(
-            _get_lib(),
-            is_write=False,
-            fd=self._fd,
-            buf_base=buf_base,
-            sub=sub,
-            raw_stream=raw_stream,
+        _check(
+            _get_lib().phxfs_read_stream(
+                self._fd,
+                buf_base,
+                ctypes.byref(sub._size),
+                ctypes.byref(sub._buf_offset),
+                ctypes.byref(sub._file_offset),
+                ctypes.byref(sub._bytes_done),
+                ctypes.c_void_p(raw_stream),
+            ),
+            "phxfs_read_stream",
         )
         return sub
 
@@ -556,13 +518,17 @@ class AsyncHandle:
                 ``submission.bytes_done`` after the stream sync.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-        _submit_stream(
-            _get_lib(),
-            is_write=True,
-            fd=self._fd,
-            buf_base=buf_base,
-            sub=sub,
-            raw_stream=raw_stream,
+        _check(
+            _get_lib().phxfs_write_stream(
+                self._fd,
+                buf_base,
+                ctypes.byref(sub._size),
+                ctypes.byref(sub._buf_offset),
+                ctypes.byref(sub._file_offset),
+                ctypes.byref(sub._bytes_done),
+                ctypes.c_void_p(raw_stream),
+            ),
+            "phxfs_write_stream",
         )
         return sub
 

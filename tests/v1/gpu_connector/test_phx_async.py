@@ -248,19 +248,10 @@ class TestBufferRegistration:
         tensor = _gpu_tensor(ptr=0x200000)
         pa.register_buffer(tensor)
         pa.register_buffer(tensor)
-        # phxfs reference-counts the exact duplicate; the table keeps one row.
+        # phxfs reference-counts the exact duplicate; the wrapper records
+        # every successful call so register/deregister stay symmetric.
         assert len(_fake_lib.calls["phxfs_regmem"]) == 2
-        assert pa._reg_bases == [0x200000]
-
-    def test_duplicate_register_same_base_different_len_raises(
-        self, _fake_lib: _FakeLib
-    ) -> None:
-        pa.register_buffer(_gpu_tensor(ptr=0x200000, nbytes=_fake_lib.page_size))
-        with pytest.raises(RuntimeError, match="different length"):
-            pa.register_buffer(
-                _gpu_tensor(ptr=0x200000, nbytes=2 * _fake_lib.page_size)
-            )
-        assert len(_fake_lib.calls["phxfs_regmem"]) == 1
+        assert pa._reg_bases == [0x200000, 0x200000]
 
     def test_deregister_calls_deregmem_with_aligned_length(
         self, _fake_lib: _FakeLib
