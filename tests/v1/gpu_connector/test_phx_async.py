@@ -77,13 +77,13 @@ class _FakeLib:
             if name == "phxfs_get_map_mode":
                 return self.map_mode
             if name == "phxfs_read_stream":
-                # (fd, dev, buf, nb_p, bo_p, fo_p, bd_p, stream)
+                # (fd, buf, nb_p, bo_p, fo_p, bd_p, stream)
                 bd = self.read_stream_bd
-                args[6]._obj.value = bd if bd is not None else args[3]._obj.value
+                args[5]._obj.value = bd if bd is not None else args[2]._obj.value
                 return self.read_stream_rc
             if name == "phxfs_write_stream":
                 bd = self.write_stream_bd
-                args[6]._obj.value = bd if bd is not None else args[3]._obj.value
+                args[5]._obj.value = bd if bd is not None else args[2]._obj.value
                 return self.write_stream_rc
             return 0
 
@@ -363,11 +363,10 @@ class TestAsyncHandleIO:
         # One stream-ordered submission, no synchronous fallback call.
         assert len(_fake_lib.calls["phxfs_read_stream"]) == 1
         assert "phxfs_read" not in _fake_lib.calls
-        fd, device, buf, nb_p, bo_p, fo_p, bd_p, stream = _fake_lib.calls[
-            "phxfs_read_stream"
-        ][0]
+        fd, buf, nb_p, bo_p, fo_p, bd_p, stream = _fake_lib.calls["phxfs_read_stream"][
+            0
+        ]
         assert fd == 5
-        assert device == 0
         assert buf == 0x300000
         # The submission's ctypes storage is handed in by reference.
         assert nb_p._obj is submission._size
@@ -380,7 +379,13 @@ class TestAsyncHandleIO:
         assert stream.value == 0x9
         # The fake completed the transfer synchronously.
         assert submission.bytes_done == 4096
-    def test_read_async_resolves_device_per_buffer(self, _fake_lib: _FakeLib) -> None:
+
+    def test_read_async_submits_across_multiple_devices(
+        self, _fake_lib: _FakeLib
+    ) -> None:
+        # The device is resolved inside the library from the buffer; the
+        # wrapper no longer maps buf -> device (two devices registered,
+        # both buffers submit fine through the same path).
         _fake_lib.find_dev_results = {0: 0, 1: 5}
         pa.register_buffer(_gpu_tensor(ptr=0x100000, cuda_index=0))
         pa.register_buffer(_gpu_tensor(ptr=0x300000, cuda_index=1))
@@ -390,8 +395,8 @@ class TestAsyncHandleIO:
         self._handle().read_async(
             buf_base=0x300000, size=4096, file_offset=0, buf_offset=0, raw_stream=0x9
         )
-        devices = [call[1] for call in _fake_lib.calls["phxfs_read_stream"]]
-        assert devices == [0, 5]
+        bufs = [call[1] for call in _fake_lib.calls["phxfs_read_stream"]]
+        assert bufs == [0x100000, 0x300000]
 
     def test_read_async_submission_error_raises(self, _fake_lib: _FakeLib) -> None:
         self._registered()
@@ -421,16 +426,21 @@ class TestAsyncHandleIO:
         # in bytes_done after the stream sync -- no synchronous raise.
         assert submission.bytes_done == -28
 
-    def test_read_async_unregistered_buffer_raises(self, _fake_lib: _FakeLib) -> None:
-        with pytest.raises(RuntimeError, match="not inside any registered"):
-            self._handle().read_async(
-                buf_base=0x400000,
-                size=4096,
-                file_offset=0,
-                buf_offset=0,
-                raw_stream=0x9,
-            )
-        assert "phxfs_read_stream" not in _fake_lib.calls
+    def test_read_async_unregistered_buffer_passes_through(
+        self, _fake_lib: _FakeLib
+    ) -> None:
+        # The device resolution lives in the library now: an unregistered
+        # buffer is submitted as-is (the library treats a registration
+        # miss as a plain CPU address, like the synchronous API).
+        submission = self._handle().read_async(
+            buf_base=0x400000,
+            size=4096,
+            file_offset=0,
+            buf_offset=0,
+            raw_stream=0x9,
+        )
+        assert len(_fake_lib.calls["phxfs_read_stream"]) == 1
+        assert submission.bytes_done == 4096
 
     def test_io_needs_no_stream_registration(self, _fake_lib: _FakeLib) -> None:
         # No register_stream call anywhere: an unregistered stream is
@@ -458,11 +468,10 @@ class TestAsyncHandleIO:
         # Stream-ordered write: no host-side stream synchronization.
         assert len(_fake_lib.calls["phxfs_write_stream"]) == 1
         assert "phxfs_write" not in _fake_lib.calls
-        fd, device, buf, nb_p, bo_p, fo_p, bd_p, stream = _fake_lib.calls[
-            "phxfs_write_stream"
-        ][0]
+        fd, buf, nb_p, bo_p, fo_p, bd_p, stream = _fake_lib.calls["phxfs_write_stream"][
+            0
+        ]
         assert fd == 5
-        assert device == 0
         assert buf == 0x300000
         assert nb_p._obj.value == 2048
         assert bo_p._obj.value == 128
@@ -555,8 +564,6 @@ class TestCloseDriver:
         assert closed == [0, 5]
         assert pa._reg_bases == []
         assert pa._devices == {}
-        with pytest.raises(RuntimeError, match="not inside any registered"):
-            pa._lookup_device(0x100000)
 
     def test_without_state_is_noop(self, _fake_lib: _FakeLib) -> None:
         pa.close_driver()

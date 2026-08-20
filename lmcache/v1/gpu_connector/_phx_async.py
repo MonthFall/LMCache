@@ -25,13 +25,10 @@ handed to the C API by reference and must stay alive until then (the
 caller -- :mod:`lmcache.v1.gpu_connector.gds_context` -- keeps
 submissions behind a GPU event checkpoint).
 
-``libphoenix`` must expose the stream-ordered API
-(``phxfs_read_stream`` / ``phxfs_write_stream``): loading fails fast
-otherwise (there is no synchronous fallback).
-
-LMCache expects ``libphoenix.so`` exposing the phxfs API (``phoenix.h``);
-the library is resolved through the loader (``ldconfig`` or
-``LD_LIBRARY_PATH``).
+``libphoenix.so`` (resolving via ``ldconfig`` / ``LD_LIBRARY_PATH``) must
+expose the stream-ordered API (``phxfs_read_stream`` /
+``phxfs_write_stream``): loading fails fast otherwise (there is no
+synchronous fallback).
 """
 
 # Standard
@@ -98,9 +95,8 @@ def _declare_signatures(lib: ctypes.CDLL, path_hint: str) -> None:
     ]
     lib.phxfs_deregmem.restype = ctypes.c_int
 
-    stream_params = [
+    stream_params: list[type] = [
         ctypes.c_int,  # int fd
-        ctypes.c_int,  # int device_id (phxfs index)
         ctypes.c_void_p,  # void *buf
         ctypes.POINTER(ctypes.c_size_t),  # size_t *nbytes
         ctypes.POINTER(ctypes.c_int64),  # off_t *buf_offset
@@ -130,9 +126,10 @@ def _get_lib() -> ctypes.CDLL:
 # --- Device + buffer registration state ----------------------------------
 #
 # phxfs devices are opened once per CUDA/HIP ordinal (find_dev + open) and
-# cached; registered buffers are tracked in a sorted table so that IO can
-# resolve the owning phxfs device from the buffer base pointer and so that
-# deregistration passes the same (aligned) length that was registered.
+# cached. Registered buffers are tracked in a sorted table so that
+# deregistration passes the same (aligned) length that was registered and
+# so duplicate registrations are detected. (The IO path resolves the
+# buffer device inside libphoenix — this table is not consulted for IO.)
 
 _state_lock = threading.Lock()
 _devices: dict[int, int] = {}
@@ -167,7 +164,7 @@ def _get_page_size_locked(lib: ctypes.CDLL) -> int:
 def _ensure_device_open_locked(lib: ctypes.CDLL, cuda_ordinal: int) -> int:
     """Open the phxfs device for ``cuda_ordinal`` once. Caller holds the lock.
 
-    Returns the phxfs device index used for regmem / read / write.
+    Returns the phxfs device index used for regmem / deregmem.
 
     Raises:
         RuntimeError: If ``phxfs_find_dev`` or ``phxfs_open`` fails.
@@ -194,31 +191,6 @@ def _ensure_device_open_locked(lib: ctypes.CDLL, cuda_ordinal: int) -> int:
         mode_name,
         _get_page_size_locked(lib) // 1024,
     )
-    return phxfs_dev
-
-
-def _lookup_device(buf_base: int) -> int:
-    """Resolve the phxfs device whose registration covers ``buf_base``.
-
-    Returns:
-        The phxfs device index for the registration containing ``buf_base``.
-
-    Raises:
-        RuntimeError: If ``buf_base`` does not fall inside any registered
-            buffer.
-    """
-    with _state_lock:
-        idx = bisect.bisect_right(_reg_bases, buf_base) - 1
-        if idx < 0:
-            raise RuntimeError(
-                f"buf_base 0x{buf_base:x} is not inside any registered phxfs buffer"
-            )
-        base = _reg_bases[idx]
-        aligned_len, phxfs_dev = _reg_entries[idx]
-        if buf_base >= base + aligned_len:
-            raise RuntimeError(
-                f"buf_base 0x{buf_base:x} is not inside any registered phxfs buffer"
-            )
     return phxfs_dev
 
 
@@ -348,13 +320,10 @@ def deregister_buffer(buf: torch.Tensor) -> None:
 def register_stream(raw_stream: int) -> None:
     """No-op: phxfs needs no stream registration.
 
-    Every phxfs stream submission carries the stream handle; there is no
-    per-stream state on the library side (unlike cuFile's optional
-    cuFileStreamRegister performance hint). Kept because the GDS L1 tier's
-    backend surface (:mod:`lmcache.v1.gpu_connector._gds_async`) exports
-    ``register_stream`` and
-    :meth:`gds_context.GDSContext.register_gpu_buffer` calls it uniformly
-    for every backend.
+    Every phxfs submission carries the stream handle (unlike cuFile's
+    optional cuFileStreamRegister hint). Kept only because the shared
+    backend surface (``_gds_async`` re-exports it and ``gds_context``
+    calls it uniformly).
 
     Args:
         raw_stream: Raw CUDA/ROCm stream handle (ignored).
@@ -410,7 +379,6 @@ def _submit_stream(
     is_write: bool,
     fd: int,
     buf_base: int,
-    phxfs_dev: int,
     sub: "Submission",
     raw_stream: int,
 ) -> None:
@@ -420,6 +388,8 @@ def _submit_stream(
     library reads the transfer parameters at submission time and writes
     ``bytes_done`` asynchronously, so ``sub`` must stay alive until the
     stream is synchronized past this op (the caller owns that lifetime).
+    The buffer device is resolved inside the library from the buffer
+    itself (registration table hit -> GPU DMA, miss -> plain CPU address).
 
     Raises:
         RuntimeError: On a submission-level failure (negative return from
@@ -430,7 +400,6 @@ def _submit_stream(
     rc = int(
         fn(
             fd,
-            phxfs_dev,
             buf_base,
             ctypes.byref(sub._size),
             ctypes.byref(sub._buf_offset),
@@ -442,7 +411,7 @@ def _submit_stream(
     if rc < 0:
         op = "phxfs_write_stream" if is_write else "phxfs_read_stream"
         raise RuntimeError(
-            f"{op} failed with {rc}: fd={fd}, device={phxfs_dev}, "
+            f"{op} failed with {rc}: fd={fd}, "
             f"buf_base=0x{buf_base:x}, stream=0x{raw_stream:x}"
         )
 
@@ -522,7 +491,7 @@ class AsyncHandle:
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
-        """Submit a stream-ordered read DMA into the registered GPU buffer.
+        """Submit a stream-ordered read DMA into a registered GPU buffer.
 
         Returns immediately; the data is guaranteed to be visible to any
         op the caller enqueues on ``raw_stream`` after this call. The
@@ -534,14 +503,15 @@ class AsyncHandle:
             size: Transfer length in bytes.
             file_offset: Slab-file offset to read from.
             buf_offset: Offset within the GPU buffer region.
-            raw_stream: Raw handle of the registered stream ordering the DMA.
+            raw_stream: Raw CUDA/ROCm stream handle ordering the DMA.
 
         Returns:
             The in-flight submission (keep alive until the stream sync).
 
         Raises:
-            RuntimeError: If ``buf_base`` is not registered or the
-                submission itself fails.
+            RuntimeError: On a submission-level failure. Transfer
+                failures are NOT raised -- they land in
+                ``submission.bytes_done`` after the stream sync.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         _submit_stream(
@@ -549,7 +519,6 @@ class AsyncHandle:
             is_write=False,
             fd=self._fd,
             buf_base=buf_base,
-            phxfs_dev=_lookup_device(buf_base),
             sub=sub,
             raw_stream=raw_stream,
         )
@@ -576,14 +545,15 @@ class AsyncHandle:
             size: Transfer length in bytes.
             file_offset: Slab-file offset to write to.
             buf_offset: Offset within the GPU buffer region.
-            raw_stream: Raw handle of the registered stream ordering the DMA.
+            raw_stream: Raw CUDA/ROCm stream handle ordering the DMA.
 
         Returns:
             The in-flight submission (keep alive until the stream sync).
 
         Raises:
-            RuntimeError: If ``buf_base`` is not registered or the
-                submission itself fails.
+            RuntimeError: On a submission-level failure. Transfer
+                failures are NOT raised -- they land in
+                ``submission.bytes_done`` after the stream sync.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         _submit_stream(
@@ -591,7 +561,6 @@ class AsyncHandle:
             is_write=True,
             fd=self._fd,
             buf_base=buf_base,
-            phxfs_dev=_lookup_device(buf_base),
             sub=sub,
             raw_stream=raw_stream,
         )
