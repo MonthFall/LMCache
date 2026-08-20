@@ -10,7 +10,9 @@ common backend surface maps naturally:
   device and registers the buffer 64 KiB-aligned).
 - :func:`register_handle` is a passthrough: phxfs operates on plain POSIX
   fds, so the "handle" is the fd itself.
-- :func:`register_stream` wraps ``phxfs_regstream``; IO submissions are
+- :func:`register_stream` / :func:`deregister_stream` are no-ops: phxfs
+  has no stream registration (every submission carries the stream); the
+  functions exist for the shared backend surface. IO submissions are
   stream-ordered via ``phxfs_read_stream`` / ``phxfs_write_stream``.
 
 Execution semantics (stream-ordered, cuFile-compatible): submissions
@@ -106,16 +108,15 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
 
     # Stream-ordered API (libphoenix with stream support). The signatures
     # mirror cuFileReadAsync/WriteAsync: size/offset/result are pointers the
-    # library writes asynchronously; the stream orders the DMA. Guarded so
-    # an older libphoenix without the symbols still loads (the module then
-    # degrades to the synchronous path).
+    # library writes asynchronously; the stream orders the DMA. There is no
+    # stream registration in phxfs (every submission carries the stream).
+    # Guarded so an older libphoenix without the symbols still loads (the
+    # module then degrades to the synchronous path).
     if all(
         hasattr(lib, sym)
         for sym in (
             "phxfs_read_stream",
             "phxfs_write_stream",
-            "phxfs_regstream",
-            "phxfs_deregstream",
         )
     ):
         stream_params = [
@@ -132,18 +133,6 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
         lib.phxfs_read_stream.restype = ctypes.c_int
         lib.phxfs_write_stream.argtypes = stream_params
         lib.phxfs_write_stream.restype = ctypes.c_int
-
-        lib.phxfs_regstream.argtypes = [
-            ctypes.c_int,  # int device_id (phxfs index)
-            ctypes.c_void_p,  # void *stream
-        ]
-        lib.phxfs_regstream.restype = ctypes.c_int
-
-        lib.phxfs_deregstream.argtypes = [
-            ctypes.c_int,  # int device_id (phxfs index)
-            ctypes.c_void_p,  # void *stream
-        ]
-        lib.phxfs_deregstream.restype = ctypes.c_int
 
 
 def _get_lib() -> ctypes.CDLL:
@@ -173,8 +162,6 @@ _reg_bases: list[int] = []
 """Sorted registered buffer base pointers (parallel to ``_reg_entries``)."""
 _reg_entries: list[tuple[int, int]] = []
 """(aligned_length, phxfs_device_index) per entry in ``_reg_bases``."""
-_streams: dict[int, int] = {}
-"""Registered raw stream handle -> phxfs device index (for deregistration)."""
 
 _page_size: int = 0
 """Cached device page size in bytes (64 KiB on NVIDIA); 0 = not queried."""
@@ -188,8 +175,6 @@ _MAP_MODE_NAMES = {0: "FULL", 1: "STAGING"}
 _STREAM_SYMBOLS = (
     "phxfs_read_stream",
     "phxfs_write_stream",
-    "phxfs_regstream",
-    "phxfs_deregstream",
 )
 
 
@@ -404,84 +389,36 @@ def deregister_buffer(buf: torch.Tensor) -> None:
 
 
 def register_stream(raw_stream: int) -> None:
-    """Register a GPU stream for stream-ordered phxfs IO.
+    """No-op: phxfs needs no stream registration.
 
-    Wraps ``phxfs_regstream``: the library allocates a completion flag on
-    the device and wires the stream's ordering gate. The device is taken
-    from the current CUDA/ROCm device (the GDS L1 tier registers streams
-    from the worker's single-GPU context). Without the stream API in
-    libphoenix this is a no-op (synchronous degradation).
+    Every phxfs stream submission carries the stream handle; there is no
+    per-stream state on the library side (unlike cuFile's optional
+    cuFileStreamRegister performance hint). Kept because the GDS L1 tier's
+    backend surface (:mod:`lmcache.v1.gpu_connector._gds_async`) exports
+    ``register_stream`` and
+    :meth:`gds_context.GDSContext.register_gpu_buffer` calls it uniformly
+    for every backend.
 
     Args:
-        raw_stream: Raw CUDA/ROCm stream handle, as passed by
-            :meth:`gds_context.GDSContext.register_gpu_buffer`.
-
-    Raises:
-        RuntimeError: If the phxfs device cannot be opened or
-            ``phxfs_regstream`` fails.
+        raw_stream: Raw CUDA/ROCm stream handle (ignored).
     """
-    lib = _get_lib()
-    if not _has_stream_api(lib):
-        return
-    cuda_ordinal = torch.cuda.current_device()
-    with _state_lock:
-        if raw_stream in _streams:
-            return  # idempotent: gds_context already guards, be tolerant
-        phxfs_dev = _ensure_device_open_locked(lib, cuda_ordinal)
-        rc = int(lib.phxfs_regstream(phxfs_dev, ctypes.c_void_p(raw_stream)))
-        if rc < 0:
-            raise RuntimeError(
-                f"phxfs_regstream failed with {rc}: device={phxfs_dev}, "
-                f"stream=0x{raw_stream:x}"
-            )
-        _streams[raw_stream] = phxfs_dev
+    del raw_stream
 
 
 def deregister_stream(raw_stream: int) -> None:
-    """Reverse of :func:`register_stream`.
-
-    Wraps ``phxfs_deregstream``, which blocks until every submission still
-    in flight on the stream has completed. Unregistered streams are
-    ignored (matching the tolerance of the cuFile path teardown).
-
-    Raises:
-        RuntimeError: If ``phxfs_deregstream`` fails.
-    """
-    lib = _get_lib()
-    with _state_lock:
-        phxfs_dev = _streams.get(raw_stream)
-        if phxfs_dev is None:
-            return
-        rc = int(lib.phxfs_deregstream(phxfs_dev, ctypes.c_void_p(raw_stream)))
-        if rc < 0:
-            raise RuntimeError(
-                f"phxfs_deregstream failed with {rc}: device={phxfs_dev}, "
-                f"stream=0x{raw_stream:x}"
-            )
-        del _streams[raw_stream]
+    """Reverse of :func:`register_stream`: nothing to do for phxfs."""
+    del raw_stream
 
 
 def close_driver() -> None:
     """Release every phxfs registration and close all opened devices.
 
-    Sweeps any stream/buffer registration still left in the tables (the
-    normal teardown path deregisters each via :func:`deregister_stream` /
-    :func:`deregister_buffer`), then closes every opened phxfs device.
+    Sweeps any buffer registration still left in the table (the normal
+    teardown path deregisters each via :func:`deregister_buffer`), then
+    closes every opened phxfs device.
     """
     lib = _get_lib()
     with _state_lock:
-        for raw_stream, phxfs_dev in list(_streams.items()):
-            try:
-                rc = int(lib.phxfs_deregstream(phxfs_dev, ctypes.c_void_p(raw_stream)))
-                if rc < 0:
-                    logger.warning(
-                        "close_driver: phxfs_deregstream(0x%x) failed with %d",
-                        raw_stream,
-                        rc,
-                    )
-            except Exception as e:  # noqa: BLE001 - teardown sweep
-                logger.warning("close_driver: phxfs_deregstream raised %s", e)
-        _streams.clear()
         for base, (aligned_len, phxfs_dev) in zip(
             _reg_bases, _reg_entries, strict=True
         ):
@@ -532,13 +469,6 @@ def _submit_stream(
             the C API). Transfer failures are NOT raised here -- they land
             in ``sub.bytes_done`` after the stream sync (cuFile contract).
     """
-    with _state_lock:
-        registered = raw_stream in _streams
-    if not registered:
-        raise RuntimeError(
-            f"{'write' if is_write else 'read'}_async: stream "
-            f"0x{raw_stream:x} is not registered (register_stream first)"
-        )
     fn = lib.phxfs_write_stream if is_write else lib.phxfs_read_stream
     rc = int(
         fn(
@@ -701,8 +631,8 @@ class AsyncHandle:
             The in-flight submission (keep alive until the stream sync).
 
         Raises:
-            RuntimeError: If ``buf_base`` is not registered, the stream is
-                not registered, or the submission itself fails.
+            RuntimeError: If ``buf_base`` is not registered or the
+                submission itself fails.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         lib = _get_lib()
@@ -754,8 +684,8 @@ class AsyncHandle:
             The in-flight submission (keep alive until the stream sync).
 
         Raises:
-            RuntimeError: If ``buf_base`` is not registered, the stream is
-                not registered, or the submission itself fails.
+            RuntimeError: If ``buf_base`` is not registered or the
+                submission itself fails.
         """
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         lib = _get_lib()
